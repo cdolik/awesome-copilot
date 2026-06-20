@@ -1,20 +1,28 @@
 /**
  * Workflows page functionality
  */
-import { createChoices, getChoicesValues, type Choices } from "../choices";
-import { FuzzySearch, type SearchItem } from "../search";
+import {
+  createChoices,
+  getChoicesValues,
+  setChoicesValues,
+  type Choices,
+} from "../choices";
 import {
   fetchData,
-  debounce,
-  escapeHtml,
-  getGitHubUrl,
-  getActionButtonsHtml,
+  getQueryParam,
+  getQueryParamValues,
   setupActionHandlers,
-  getLastUpdatedHtml,
+  updateQueryParams,
 } from "../utils";
 import { setupModal, openFileModal } from "../modal";
+import {
+  renderWorkflowsHtml,
+  sortWorkflows,
+  type RenderableWorkflow,
+  type WorkflowSortOption,
+} from "./workflows-render";
 
-interface Workflow extends SearchItem {
+interface Workflow extends RenderableWorkflow {
   id: string;
   path: string;
   triggers: string[];
@@ -28,121 +36,81 @@ interface WorkflowsData {
   };
 }
 
-type SortOption = "title" | "lastUpdated";
-
 const resourceType = "workflow";
 let allItems: Workflow[] = [];
-let search = new FuzzySearch<Workflow>();
 let triggerSelect: Choices;
 let currentFilters = {
   triggers: [] as string[],
 };
-let currentSort: SortOption = "title";
+let currentSort: WorkflowSortOption = "title";
+let resourceListHandlersReady = false;
 
 function sortItems(items: Workflow[]): Workflow[] {
-  return [...items].sort((a, b) => {
-    if (currentSort === "lastUpdated") {
-      const dateA = a.lastUpdated ? new Date(a.lastUpdated).getTime() : 0;
-      const dateB = b.lastUpdated ? new Date(b.lastUpdated).getTime() : 0;
-      return dateB - dateA;
-    }
-    return a.title.localeCompare(b.title);
-  });
+  return sortWorkflows(items, currentSort);
 }
 
 function applyFiltersAndRender(): void {
-  const searchInput = document.getElementById(
-    "search-input"
-  ) as HTMLInputElement;
   const countEl = document.getElementById("results-count");
-  const query = searchInput?.value || "";
-
-  let results = query ? search.search(query) : [...allItems];
+  let results = [...allItems];
 
   if (currentFilters.triggers.length > 0) {
     results = results.filter((item) =>
-      item.triggers.some((t) => currentFilters.triggers.includes(t))
+      item.triggers.some((trigger) => currentFilters.triggers.includes(trigger))
     );
   }
 
   results = sortItems(results);
 
-  renderItems(results, query);
-  const activeFilters: string[] = [];
-  if (currentFilters.triggers.length > 0)
-    activeFilters.push(
-      `${currentFilters.triggers.length} trigger${
-        currentFilters.triggers.length > 1 ? "s" : ""
-      }`
-    );
-  let countText = `${results.length} of ${allItems.length} workflows`;
-  if (activeFilters.length > 0) {
-    countText += ` (filtered by ${activeFilters.join(", ")})`;
+  renderItems(results);
+  let countText = `${results.length} workflow${results.length === 1 ? "" : "s"}`;
+  if (currentFilters.triggers.length > 0) {
+    countText = `${results.length} of ${allItems.length} workflows (filtered by ${currentFilters.triggers.length} trigger${currentFilters.triggers.length > 1 ? "s" : ""})`;
   }
   if (countEl) countEl.textContent = countText;
 }
 
-function renderItems(items: Workflow[], query = ""): void {
+function renderItems(items: Workflow[]): void {
   const list = document.getElementById("resource-list");
   if (!list) return;
 
-  if (items.length === 0) {
-    list.innerHTML =
-      '<div class="empty-state"><h3>No workflows found</h3><p>Try a different search term or adjust filters</p></div>';
-    return;
-  }
+  list.innerHTML = renderWorkflowsHtml(items);
+}
 
-  list.innerHTML = items
-    .map(
-      (item) => `
-    <div class="resource-item" data-path="${escapeHtml(item.path)}">
-      <div class="resource-info">
-        <div class="resource-title">${
-          query ? search.highlight(item.title, query) : escapeHtml(item.title)
-        }</div>
-        <div class="resource-description">${escapeHtml(
-          item.description || "No description"
-        )}</div>
-        <div class="resource-meta">
-          ${item.triggers
-            .map(
-              (t) =>
-                `<span class="resource-tag tag-trigger">${escapeHtml(t)}</span>`
-            )
-            .join("")}
-          ${getLastUpdatedHtml(item.lastUpdated)}
-        </div>
-      </div>
-      <div class="resource-actions">
-        ${getActionButtonsHtml(item.path)}
-        <a href="${getGitHubUrl(
-          item.path
-        )}" class="btn btn-secondary" target="_blank" onclick="event.stopPropagation()" title="View on GitHub">GitHub</a>
-      </div>
-    </div>
-  `
-    )
-    .join("");
+function setupResourceListHandlers(list: HTMLElement | null): void {
+  if (!list || resourceListHandlersReady) return;
 
-  // Add click handlers for opening modal
-  list.querySelectorAll(".resource-item").forEach((el) => {
-    el.addEventListener("click", (e) => {
-      if ((e.target as HTMLElement).closest(".resource-actions")) return;
-      const path = (el as HTMLElement).dataset.path;
-      if (path) openFileModal(path, resourceType);
-    });
+  list.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    if (target.closest(".resource-actions")) {
+      return;
+    }
+
+    const item = target.closest(".resource-item") as HTMLElement | null;
+    const path = item?.dataset.path;
+    if (path) {
+      openFileModal(path, resourceType);
+    }
+  });
+
+  resourceListHandlersReady = true;
+}
+
+function syncUrlState(): void {
+  updateQueryParams({
+    q: "",
+    trigger: currentFilters.triggers,
+    sort: currentSort === "title" ? "" : currentSort,
   });
 }
 
 export async function initWorkflowsPage(): Promise<void> {
   const list = document.getElementById("resource-list");
-  const searchInput = document.getElementById(
-    "search-input"
-  ) as HTMLInputElement;
   const clearFiltersBtn = document.getElementById("clear-filters");
   const sortSelect = document.getElementById(
     "sort-select"
   ) as HTMLSelectElement;
+
+  setupResourceListHandlers(list as HTMLElement | null);
 
   const data = await fetchData<WorkflowsData>("workflows.json");
   if (!data || !data.items) {
@@ -153,43 +121,53 @@ export async function initWorkflowsPage(): Promise<void> {
   }
 
   allItems = data.items;
-  search.setItems(allItems);
 
-  // Setup trigger filter
   triggerSelect = createChoices("#filter-trigger", {
     placeholderValue: "All Triggers",
   });
   triggerSelect.setChoices(
-    data.filters.triggers.map((t) => ({ value: t, label: t })),
+    data.filters.triggers.map((trigger) => ({ value: trigger, label: trigger })),
     "value",
     "label",
     true
   );
+
+  const initialTriggers = getQueryParamValues("trigger").filter((trigger) =>
+    data.filters.triggers.includes(trigger)
+  );
+  const initialSort = getQueryParam("sort");
+
+  if (initialTriggers.length > 0) {
+    currentFilters.triggers = initialTriggers;
+    setChoicesValues(triggerSelect, initialTriggers);
+  }
+  if (initialSort === "lastUpdated") {
+    currentSort = initialSort;
+    if (sortSelect) sortSelect.value = initialSort;
+  }
+
   document.getElementById("filter-trigger")?.addEventListener("change", () => {
     currentFilters.triggers = getChoicesValues(triggerSelect);
     applyFiltersAndRender();
+    syncUrlState();
   });
 
   sortSelect?.addEventListener("change", () => {
-    currentSort = sortSelect.value as SortOption;
+    currentSort = sortSelect.value as WorkflowSortOption;
     applyFiltersAndRender();
+    syncUrlState();
   });
-
-  applyFiltersAndRender();
-  searchInput?.addEventListener(
-    "input",
-    debounce(() => applyFiltersAndRender(), 200)
-  );
 
   clearFiltersBtn?.addEventListener("click", () => {
     currentFilters = { triggers: [] };
     currentSort = "title";
     triggerSelect.removeActiveItems();
-    if (searchInput) searchInput.value = "";
     if (sortSelect) sortSelect.value = "title";
     applyFiltersAndRender();
+    syncUrlState();
   });
 
+  applyFiltersAndRender();
   setupModal();
   setupActionHandlers();
 }
